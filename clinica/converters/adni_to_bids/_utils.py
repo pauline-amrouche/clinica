@@ -383,7 +383,7 @@ def _get_session_id_from_visit_code(visit_code: str) -> Optional[str]:
 
     if _is_visit_code_not_supported(visit_code):
         return None
-    if visit_code == "sc":
+    if visit_code == "sc" or visit_code == "scmri":
         return "sc"
     return viscode_to_session(visit_code)
 
@@ -394,7 +394,7 @@ def _is_visit_code_not_supported(visit_code: str) -> bool:
     There are a few known values like "f" or "uns1" which are present in
     ADNI data that are not supported for a mapping to a session ID.
     """
-    unsupported_values = {"f", "uns1"}
+    unsupported_values = {"f", "uns1", "nv"}
     return pd.isnull(visit_code) or visit_code in unsupported_values
 
 
