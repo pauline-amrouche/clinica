@@ -5,6 +5,8 @@ from typing import Any, Iterable, Optional
 
 import pandas as pd
 
+from clinica.utils.filemanip import replace_special_characters_with_symbol
+
 __all__ = ["convert_t1"]
 
 
@@ -18,6 +20,10 @@ def convert_t1(
     n_procs: int = 1,
 ):
     """Convert T1 MR images of ADNI into BIDS format.
+
+    For this function to run correctly, you need to download the table
+    matching scans and their image ID as described in `docs.Converters.ADNI2BIDS.md`
+    this table should then be placed in `csv_dir`.
 
     Parameters
     ----------
@@ -56,7 +62,18 @@ def convert_t1(
         ),
         lvl="info",
     )
-    images = _compute_t1_paths(source_dir, csv_dir, subjects, conversion_dir)
+
+    # Ensure image ids conversion table is in csv files
+    img_ids_csv = [f for f in csv_dir.glob('*_ADNI_Image_ID_matching_from_LONI.csv')]
+    if len(img_ids_csv) == 0:
+        raise FileNotFoundError(
+            "You should download the correspondance table between Image_ID and scans metadata",
+            "rename it to [DATA]_ADNI_Image_ID_matching_from_LONI.csv and place it in",
+            "`CLINICAL_DATA_DIRECTORY`. See `docs.Converters.ADNI2BIDS.md` for more details."
+        )
+    img_ids = pd.read_csv(img_ids_csv[0])
+
+    images = _compute_t1_paths(source_dir, csv_dir, subjects, conversion_dir, img_ids)
     cprint(
         f"Paths of {ADNIModalityConverter.T1.value} images found. Exporting images into BIDS ...",
         lvl="info",
@@ -70,38 +87,28 @@ def convert_t1(
     )
     cprint(msg=f"{ADNIModalityConverter.T1.value} conversion done.", lvl="debug")
 
-
-def _compute_t1_paths(
-    source_dir: Path,
+def _select_preferred_scans(
     csv_dir: Path,
     subjects: Iterable[str],
-    conversion_dir: Path,
 ) -> pd.DataFrame:
-    """Compute the paths to T1 MR images and store them in a TSV file.
+    """Select the preferred scan for each subject and session.
 
     Parameters
     ----------
-    source_dir : Path
-        The path to the ADNI directory.
-
     csv_dir : Path
         The path to the clinical data directory.
 
     subjects : list of str
         The subjects list.
 
-    conversion_dir : Path
-        The path to the TSV files including the paths to original images.
-
     Returns
     -------
-    images : pd.DataFrame
-        A dataframe with all the paths to the T1 MR images that will be converted into BIDS.
+    t1_df : pd.DataFrame
+        A dataframe with the metadata of scans that will be converted into BIDS.
     """
     from clinica.utils.stream import cprint
 
     from .._utils import load_clinical_csv
-    from ._image_path_utils import find_image_path
     from ._visits_utils import visits_to_timepoints
 
     t1_dfs_list = []
@@ -178,8 +185,51 @@ def _compute_t1_paths(
         ]
         t1_df.drop(error_indices, inplace=True)
 
+    return t1_df
+
+
+def _compute_t1_paths(
+    source_dir: Path,
+    csv_dir: Path,
+    subjects: Iterable[str],
+    conversion_dir: Path,
+    img_ids: str,
+) -> pd.DataFrame:
+    """Compute the paths to T1 MR images and store them in a TSV file.
+
+    Parameters
+    ----------
+    source_dir : Path
+        The path to the ADNI directory.
+
+    csv_dir : Path
+        The path to the clinical data directory.
+
+    subjects : list of str
+        The subjects list.
+
+    conversion_dir : Path
+        The path to the TSV files including the paths to original images.
+
+    img_ids : pd.DataFrame
+        DataFrame containing image ID correspondence from ADNI.
+
+    Returns
+    -------
+    images : pd.DataFrame
+        A dataframe with all the paths to the T1 MR images that will be converted into BIDS.
+    """
+
+    from ._image_path_utils import find_image_path
+
+    # For each participant and session, select the image to convert
+    t1_df = _select_preferred_scans(csv_dir, subjects)
+
+    # Update image ID to match the sequence name
+    t1_df_updated = _match_correct_image_ids(t1_df, img_ids)
+
     # Checking for images paths in filesystem
-    images = find_image_path(t1_df, source_dir, modality="T1")
+    images = find_image_path(t1_df_updated, source_dir, modality="T1")
     images.to_csv(conversion_dir / "t1_paths.tsv", sep="\t", index=False)
 
     return images
@@ -236,6 +286,9 @@ def _get_known_conversion_errors() -> Iterable[tuple[str, str]]:
         ("029_S_2395", "m72"),
         ("114_S_6039", "bl"),
         ("016_S_4952", "m48"),
+        # Errors (When selecting N3 scans)
+        ("082_S_4224", "m24"),
+        ("033_S_1016",	"m120")
     ]
 
 
@@ -279,7 +332,6 @@ def _select_preferred_scan_for_subject_in_adni1go2(
         Dictionary containing selected scan information.
         Returns None if no scan found.
     """
-    from clinica.utils.filemanip import replace_special_characters_with_symbol
 
     # filter out images that do not pass QC
     mprage_meta_subj = mprage_meta_subj[
@@ -683,3 +735,112 @@ def _check_qc(
         )
         return False
     return True
+
+def _match_correct_image_ids(
+        t1_df: pd.DataFrame,
+        img_ids: pd.DataFrame,
+        verbose: int = 1,
+    ) -> pd.DataFrame:
+    '''
+    Find the correct image ID for each scan.
+
+    This function identifies the correct Image_ID for each T1 scan by matching
+    subject, session, sequence, and scan date information from the metadata
+    in `t1_df` extracted from clinical files with the corresponding data from
+    the ADNI platform.
+
+    You need to download the table matching scans and their image ID,
+    see docs.Converters.ADNI2BIDS.md
+
+    The function handles three main cases:
+    1. Perfect matches where all identifiers match exactly
+    2. Partial matches where some identifiers match but others don't
+    3. Completely unmatched scans that will be dropped
+
+    For partial matches with multiple potential matches, the function applies
+    specific selection criteria:
+    - If the Image_ID in t1_df is one more than the desired Image_ID in img_ids,
+      it selects that match (corresponding to the previous preprocessing step)
+    - For remaining scans, it selects the first image
+
+    Parameters
+    ----------
+    t1_df : pd.DataFrame
+        DataFrame containing metadata on t1 images.
+        Expected columns: Subject_ID, Visit, Sequence, Scan_Date, Image_ID, Original
+
+    img_ids : pd.DataFrame
+        DataFrame containing image ID correspondence from ADNI.
+        Expected columns: Subject ID, Description, Type, Study Date, Image ID
+
+    verbose : int
+        Verbose level (0 or 1)
+
+    Returns
+    -------
+    pd.DataFrame
+        DataFrame containing the matched scans with correct Image_IDs.
+        Columns: Subject_ID, Visit, Sequence, Scan_Date, Image_ID, Original
+    '''
+
+    # Prepare columns to match the tables
+    t1_df['Image_ID'] = t1_df['Image_ID'].astype(str)
+    img_ids['Subject_ID'] = img_ids['Subject ID']
+    img_ids['Sequence'] = img_ids['Description'].apply(lambda s: replace_special_characters_with_symbol(s.split(' <-')[0]))
+    img_ids['Original'] = img_ids['Type'].apply(lambda s: s=='Original')
+    img_ids['Scan_Date'] = pd.to_datetime(img_ids['Study Date']).dt.strftime('%Y-%m-%d')
+    img_ids['Image_ID'] = img_ids['Image ID'].astype(str)
+    img_ids = img_ids[['Subject_ID', 'Visit', 'Sequence', 'Scan_Date', 'Image_ID', 'Original']]
+
+    if verbose:
+        print('Matching scans to correct Image ID.')
+
+    # 1. Identify perfectly matching scans
+    perfect_match = pd.merge(t1_df, img_ids,
+                            on=['Subject_ID', 'Visit', 'Sequence', 'Scan_Date', 'Image_ID', 'Original'],
+                            how='inner', validate='1:1')
+    if verbose:
+        print(f'{len(perfect_match)} scans matched directly ({len(perfect_match)/len(t1_df)*100:.2f}% of scans)')
+
+    # 2. Handle potential mismatches from clinical_data
+    # See: https://groups.google.com/g/clinica-user/c/YzgTYBylDOE/m/wqL4xcakCQAJ
+    unmatched_clinical = t1_df[~t1_df.Image_ID.isin(perfect_match.Image_ID)]
+    partial_matches = pd.merge(unmatched_clinical, img_ids,
+                            on=['Subject_ID', 'Visit', 'Sequence', 'Scan_Date', 'Original'],
+                            how='inner', validate='1:m')
+
+    # Identify completely unmatched scans (will be dropped)
+    completely_unmatched = unmatched_clinical[~unmatched_clinical.Image_ID.isin(partial_matches.Image_ID_x)]
+
+    # Identify scans with multiple matches
+    multi_match_scans = partial_matches[partial_matches.duplicated(
+        subset=['Subject_ID', 'Visit', 'Sequence', 'Scan_Date', 'Original'], keep=False)]
+
+    # Select scans with a single match
+    single_match_scans = partial_matches[~partial_matches['Image_ID_x'].isin(multi_match_scans['Image_ID_x'])]
+
+    # Select optimal Image_ID for multi-matched scans
+    # Case 1: Image_ID in t1_df is one more than the desired Image_ID in img_ids
+    # Because we want the file corresponding to the previous preprocessing step
+    selected_scans_case_1 = multi_match_scans[multi_match_scans['Image_ID_x'].astype(int) == multi_match_scans['Image_ID_y'].astype(int) + 1]
+
+    # Case 2: For remaining scans, select the first (smallest) Image_ID
+    remaining_scans = multi_match_scans[~multi_match_scans['Image_ID_x'].isin(selected_scans_case_1['Image_ID_x'])]
+    selected_scans_case_2 = remaining_scans.drop_duplicates(['Image_ID_x'], keep='first')
+
+    # Set correct Image_ID
+    imperfect_match = pd.concat([single_match_scans, selected_scans_case_1, selected_scans_case_2])
+    imperfect_match['Image_ID'] = imperfect_match['Image_ID_y']
+    imperfect_match = imperfect_match.drop(columns=['Image_ID_x', 'Image_ID_y'])
+
+    # Combine all selected scans
+    all_selected_scans = pd.concat([perfect_match, imperfect_match])
+
+    if verbose:
+        print(f'{len(completely_unmatched)} scans were not matched at all ({len(completely_unmatched)/len(t1_df)*100:.2f}% of scans)')
+        print(f'{len(single_match_scans)} scans selected with single match ({len(single_match_scans)/len(t1_df)*100:.2f}% of total scans)')
+        print(f'{len(selected_scans_case_1)} scans selected by Image_ID_x == Image_ID_y + 1 ({len(selected_scans_case_1)/len(t1_df)*100:.2f}% of total scans)')
+        print(f'{len(selected_scans_case_2)} scans selected by smallest Image_ID_y ({len(selected_scans_case_2)/len(t1_df)*100:.2f}% of total scans)')
+        print(f'{len(all_selected_scans)} scans selected in total ({len(all_selected_scans)/len(t1_df)*100:.2f}% of total scans)')
+
+    return all_selected_scans

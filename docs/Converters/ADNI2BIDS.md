@@ -62,6 +62,28 @@ verify that the extracted folder contains a collection of CSV files. This folder
 !!! note
     You do not have to modify the original folder name or rename the clinical data files before using the converter.
 
+!!! warning "Convert T1 images, additionnal step"
+    To match T1 images with their correct image ID, we need to download from the LONI platform a table with the
+    IDs correspondance with scans.
+    In the `Advanced search` tab:
+    - In the left panel:
+        - uncheck `Exclude Previous Downloads` if it is selected
+        - in `SEARCH SECTION` select Subject, Study/Visit, Image
+        - select all `IMAGE TYPES` (Original, Pre-processed, Post-processed)
+    - In the right panel:
+        - In `IMAGE` > `Modality`: select `MRI`
+        - In `IMAGING PROTOCOL` > `Weighting`: select `T1`
+        - check the box `Display in result` for the fields:
+            - `STUDY/VISIT` > `Study Date`
+            - `STUDY/VISIT` > `Visit` (the list of visit labels)
+            - `IMAGE` > `Image ID`
+    - Click on the `SEARCH` button on the botton right of the panel
+    In the `Advanced Search Results` tab:
+        - Check the `Select All` on the top right of the panel
+        - Click on `CSV Download`.
+    Rename this file to `[DATE]_ADNI_Image_ID_matching_from_LONI.csv` and place it in
+    `CLINICAL_DATA_DIRECTORY`.
+
 ## Modalities supported
 
 Currently, the modalities supported by our converter are:
